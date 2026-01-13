@@ -1,0 +1,14 @@
+{
+  "7203.T": {
+    "keywords": [
+      "トヨタ",
+      "トヨタ自動車",
+      "Toyota",
+      "TOYOTA",
+      "Toyota Motor",
+      "Toyota Motor Corporation"
+    ],
+    "gdelt_query": "(トヨタ OR トヨタ自動車 OR Toyota OR TOYOTA OR \"Toyota Motor\" OR \"Toyota Motor Corporation\") AND (sourcelang:english OR sourcelang:japanese)",
+    "use_or": true
+  }
+}

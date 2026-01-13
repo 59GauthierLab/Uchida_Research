@@ -7,3 +7,4 @@ __pycache__/
 .DS_Store
 **/figs/
 **/run_summary.json
+.env

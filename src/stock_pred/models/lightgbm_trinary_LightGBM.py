@@ -60,7 +60,12 @@ from stock_pred.dataset_pipeline import (
     make_trinary_labels,
     build_tabular_dataset,
 )
-
+from stock_pred.news_pipeline import (
+    add_news_features,
+    DEFAULT_NEWS_META_COLS,
+    DEFAULT_NEWS_SENT_COLS,
+    DEFAULT_NEWS_TONE_COLS
+)
 # =========================
 # Logging (match transformer/LSTM)
 # =========================
@@ -109,6 +114,17 @@ class DataConfig:
     ])
 
     output_root: str = "LightGBM/figs"
+
+    # ---- News features (early fusion) ----
+    use_news: bool = False
+    news_path: str = "data/news/raw/{ticker}.csv"      # {ticker} が置換される
+    news_cache_dir: str = "data/news/features"
+    news_tz: str = "Asia/Tokyo"
+    news_market_close_time: str = "15:30"
+    news_use_meta: bool = True       # 案A
+    news_use_sent: bool = True       # 案B
+    news_rolling_windows: tuple[int, int] = (3, 5)
+    news_long_window: int = 20
 
 @dataclass
 class SplitConfig:
@@ -274,6 +290,23 @@ def main():
     if DATA.use_log1p:
         df = add_log1p_features(df, DATA.log1p_candidates)
 
+    # ---- add news features (early fusion; BEFORE labeling) ----
+    if DATA.use_news:
+        df = add_news_features(
+            df,
+            ticker=DATA.ticker,
+            news_path_template=DATA.news_path,
+            cache_dir=DATA.news_cache_dir,
+            tz=DATA.news_tz,
+            market_close_time=DATA.news_market_close_time,
+            use_meta=DATA.news_use_meta,
+            use_sentiment=DATA.news_use_sent,
+            rolling_windows=DATA.news_rolling_windows,
+            long_window=DATA.news_long_window,
+        )
+    else:
+        print("[NEWS] add_news_features: skipped (DATA.use_news=False)")
+
     y_all, abs_metric = make_trinary_labels(df, horizon=DATA.horizon, k_tau=DATA.k_tau)
 
     feature_cols = [
@@ -301,6 +334,13 @@ def main():
         "rel_strength10","vix_log1p"
     ]
 
+    if DATA.use_news:
+        if DATA.news_use_meta:
+            feature_cols += DEFAULT_NEWS_META_COLS
+        if DATA.news_use_sent:
+            feature_cols += DEFAULT_NEWS_SENT_COLS
+            feature_cols += DEFAULT_NEWS_TONE_COLS
+
     X_all, y_all_np, abs_all, feature_cols_final, data = build_tabular_dataset(
         df,
         y=y_all,
@@ -313,6 +353,16 @@ def main():
         nan_tail_days=120,
     )
     y_all = y_all_np  # 以降の既存コードが y_all を使うので上書きして互換維持
+
+    news_cols = [c for c in feature_cols_final if c.startswith("news_")]
+    if news_cols:
+        print(f"[NEWS] feature_cols: {len(news_cols)} cols (head/tail) = {news_cols[:5]} ... {news_cols[-5:]}")
+        probe = [c for c in ["news_count_0d","news_sent_score_mean_0d","news_tone_mean_0d","news_no_news_flag"] if c in data.columns]
+        if probe:
+            print("[NEWS] sample(last 5 rows):")
+            print(data[probe].tail(5).to_string())
+    else:
+        print("[NEWS] feature_cols: 0 (news disabled or not merged)")
 
     print(f"[INFO] Final features d={len(feature_cols_final)} (head): {feature_cols_final[:12]}")
     _log_span(data, "final usable rows before split")

@@ -1,0 +1,21 @@
+{
+  "ticker": "7203.T",
+  "news_path": "data/news/raw/7203.T.csv",
+  "tz": "Asia/Tokyo",
+  "market_close_time": "15:30",
+  "use_meta": true,
+  "use_sentiment": true,
+  "rolling_windows": [
+    3,
+    5
+  ],
+  "long_window": 20,
+  "text_cols": [
+    "title",
+    "body"
+  ],
+  "date_span": [
+    "2001-01-01",
+    "2024-12-30"
+  ]
+}

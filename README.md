@@ -20,10 +20,11 @@
 - [3. 実行すると何が出力される？（結果の見方）](#3-実行すると何が出力される結果の見方)
 - [4. フォルダ構成とファイルの役割](#4-フォルダ構成とファイルの役割)
 - [5. 銘柄・期間・窓幅などを変えたい（設定変更の場所）](#5-銘柄期間窓幅などを変えたい設定変更の場所)
-- [6. テスト（回帰テスト）を走らせる](#6-テスト回帰テストを走らせる)
-- [7. 旧コードと結果が同じか比較したい](#7-旧コードと結果が同じか比較したい)
-- [8. 再現性（seed / TFの注意）](#8-再現性seed--tfの注意)
-- [9. よくあるつまずき（FAQ）](#9-よくあるつまずきfaq)
+- [6. ニュース特徴量の追加（GDELT）](#6-ニュース特徴量の追加gdelt)
+- [7. テスト（回帰テスト）を走らせる](#7-テスト回帰テストを走らせる)
+- [8. 旧コードと結果が同じか比較したい](#8-旧コードと結果が同じか比較したい)
+- [9. 再現性（seed / TFの注意）](#9-再現性seed--tfの注意)
+- [10. よくあるつまずき（FAQ）](#10-よくあるつまずきfaq)
 
 ---
 
@@ -55,7 +56,7 @@ pip install -r requirements.txt
 ```
 
 > TensorFlow のインストールが環境依存で失敗する場合があります。  
-> その場合は [FAQ](#9-よくあるつまずきfaq) を見てください。
+> その場合は [FAQ](#10-よくあるつまずきfaq) を見てください。
 
 ---
 
@@ -137,6 +138,9 @@ python LightGBM/trinary_LightGBM.py
 - `src/stock_pred/dataset_pipeline.py`  
   4モデル共通のデータ処理（例：株価取得、特徴量、ラベル作成、窓化/2D化など）
 
+- `src/stock_pred/news_pipeline.py`  
+  ニュース特徴量の生成（取引日整列、記事数/センチメント集約、キャッシュ）
+
 - `src/stock_pred/models/`  
   実験スクリプト本体（4モデル分）
   - `transformer_trinary_transformer_old.py`
@@ -163,6 +167,12 @@ python LightGBM/trinary_LightGBM.py
 - `tools/compare_run_summaries.py`  
   `run_summary.json` 同士を比較して、差分を見やすくする補助スクリプト
 
+- `tools/fetch_news_newsapi_ai.py`  
+  GDELT DOC API からニュースを収集して `data/news/raw/{ticker}.csv` に保存するツール
+
+- `data/news/`  
+  ニュースデータの保存先（raw / features）
+
 ---
 
 ## 5. 銘柄・期間・窓幅などを変えたい（設定変更の場所）
@@ -186,6 +196,7 @@ python LightGBM/trinary_LightGBM.py
 - `win`：ウィンドウ長（時系列入力の長さ）
 - `k_tau`：ラベル境界の係数（分類の閾値に関係）
 - `output_root`：図の出力先（モデルごとに既存パス維持のため固定されがち）
+- `use_news`：ニュース特徴量を使うか（追加した機能）
 
 > ✅ 初心者向けおすすめ手順  
 > 1) まずデフォルトのまま実行して動作確認  
@@ -194,7 +205,105 @@ python LightGBM/trinary_LightGBM.py
 
 ---
 
-## 6. テスト（回帰テスト）を走らせる
+## 6. ニュース特徴量の追加（GDELT）
+
+ニュース記事を特徴量として **early fusion** で株価特徴に結合できます。  
+主な追加コードは `src/stock_pred/news_pipeline.py` です。
+
+### 6.1 ニュースデータの形式
+
+`data/news/raw/{ticker}.csv` に保存されたニュースを読み込みます。  
+最低限必要な列は以下です（これだけあれば動きます）：
+
+- `published_at`：公開日時（文字列でOK。後で日時に変換）
+- `title`：記事タイトル
+
+あれば使われる列：
+- `body`：本文（タイトルと結合して簡易センチメント計算に使用）
+- `source`：ソース名（ユニーク数を特徴量に使用）
+- `ticker`：銘柄（無い場合はファイル名の銘柄として扱う）
+- `url`：記事URL（重複排除の一意キーとして使用）
+- `tone`：GDELTのtone（実数）。日次集約して特徴量に使用
+- `lang`：言語（空でもOK）
+
+### 6.2 取引日への整列（リーク対策）
+
+`published_at` を **取引日単位**に揃えます。  
+具体的には：
+
+- 引け後の記事は **翌取引日** に割り当て
+- 非取引日の記事は **次の取引日** に丸め
+
+これにより、未来情報の混入（リーク）を抑えています。  
+`news_market_close_time` と `news_tz` で市場時間を指定できます。
+
+### 6.3 生成される特徴量（A/B + APIセンチメント）
+
+**A: メタ系（記事数・量）**
+- `news_count_0d`, `news_source_nunique_0d`, `news_after_close_ratio_0d`
+- `news_count_3bd_sum`, `news_count_5bd_sum`
+- `news_count_surprise_20bd`, `news_no_news_flag`
+
+**B: 辞書ベースの簡易センチメント**
+- `news_sent_score_mean_0d`, `news_sent_score_sum_0d`
+- `news_pos_hits_0d`, `news_neg_hits_0d`, `news_pos_ratio_0d`
+- `news_sent_score_3bd_mean`, `news_sent_score_5bd_mean`
+
+**GDELT tone（tone）**
+- `news_tone_mean_0d`, `news_tone_sum_0d`
+- `news_tone_min_0d`, `news_tone_max_0d`
+- `news_tone_valid_count_0d`, `news_tone_valid_ratio_0d`
+- `news_tone_pos_ratio_0d`, `news_tone_neg_ratio_0d`, `news_tone_abs_mean_0d`
+- `news_tone_3bd_mean`, `news_tone_5bd_mean`
+
+> 辞書ベースの単語リストは `src/stock_pred/news_pipeline.py` の  
+> `DEFAULT_POS_WORDS / DEFAULT_NEG_WORDS` を編集して変更できます。
+
+### 6.4 使い方（設定）
+
+各モデルの `DataConfig` に以下の設定を追加しています：
+
+- `use_news`：ニュース特徴量を追加するか（デフォルトは False）
+- `news_path`：`data/news/raw/{ticker}.csv` のテンプレート
+- `news_cache_dir`：`data/news/features`（日次特徴量のparquetキャッシュ）
+- `news_tz` / `news_market_close_time`：タイムゾーンと引け時刻
+- `news_use_meta` / `news_use_sent`：A/B の切替
+- `news_rolling_windows`, `news_long_window`：rolling と驚き度の窓幅
+
+ニュース特徴量は `data/news/features/` に parquet でキャッシュされます  
+（同名 `.meta.json` に生成条件も保存）。
+
+### 6.5 ニュース収集ツール（GDELT）
+`tools/fetch_news_gdelt.py` で GDELT DOC API から取得できます。  
+事前に API キーを環境変数へ設定してください。
+
+```bash
+pip install eventregistry pandas python-dateutil python-dotenv
+```
+
+```bash
+$env:NEWSAPI_AI_KEY="YOUR_KEY"   # PowerShell
+# export NEWSAPI_AI_KEY="YOUR_KEY"  # macOS / Linux
+```
+
+`.env` に `NEWSAPI_AI_KEY=...` を書く方法でもOKです（`python-dotenv` で読み込み）。
+
+```bash
+python tools/fetch_news_newsapi_ai.py `
+  --tickers 7203.T `
+  --query-map data/news/query_map.json `
+  --days 30 `
+  --lang jpn eng `
+  --max-items 500
+```
+
+- 取得結果は `data/news/raw/{ticker}.csv` に保存されます。  
+- `data/news/query_map.json` で銘柄ごとのキーワード/概念を指定できます。  
+- Free plan は過去約1か月の制限があるため、長期実験は別手段が必要です。
+
+---
+
+## 7. テスト（回帰テスト）を走らせる
 
 テストは「学習をフルで回す」ものではなく、主に
 
@@ -211,7 +320,7 @@ pytest -q
 
 ---
 
-## 7. 旧コードと結果が同じか比較したい
+## 8. 旧コードと結果が同じか比較したい
 
 旧コードで出した `run_summary.json` と、新コードで出した `run_summary.json` を比較できます。
 
@@ -220,11 +329,11 @@ python tools/compare_run_summaries.py path/to/old/run_summary.json transformer/r
 ```
 
 > TensorFlow/GPU を使う場合、完全一致が難しい環境もあります。  
-> 詳細は [再現性の注意](#8-再現性seed--tfの注意) を参照してください。
+> 詳細は [再現性の注意](#9-再現性seed--tfの注意) を参照してください。
 
 ---
 
-## 8. 再現性（seed / TFの注意）
+## 9. 再現性（seed / TFの注意）
 
 - 共通ユーティリティで seed 固定を行います（元コードに合わせるため）
 - ただし **深層学習（TensorFlow）＋GPU** の場合、CUDA/cuDNNやカーネル実装により  
@@ -237,7 +346,7 @@ python tools/compare_run_summaries.py path/to/old/run_summary.json transformer/r
 
 ---
 
-## 9. よくあるつまずき（FAQ）
+## 10. よくあるつまずき（FAQ）
 
 ### Q1. `pip install -r requirements.txt` で TensorFlow が入らない
 A. OS / Python バージョン / CPU/GPU に依存します。  
