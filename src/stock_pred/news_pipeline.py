@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import json
-import re
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence, Optional, Tuple, Dict, List
 
@@ -11,23 +9,10 @@ import numpy as np
 import pandas as pd
 
 # ---------------------------
-# Default lexicon (MVP)
-# - “辞書の中身”は研究で説明しやすいよう、最初は小さく固定にする
-# - 日本語/英語が混在しても動くように「部分一致」を基本にする
-#   （精度を上げたい場合は形態素解析や境界条件を追加）
+# GKG-only pipeline note
+# - 全期間を GDELT GKG で取得する前提
+# - title/body を使った辞書センチメント特徴量は作らない（GKGの数値シグナルのみ使用）
 # ---------------------------
-DEFAULT_POS_WORDS: List[str] = [
-    # JP (例)
-    "上方修正", "増益", "増収", "最高益", "黒字転換", "買い", "回復", "好調", "受注増",
-    # EN (例)
-    "beat", "upgrade", "profit", "growth", "record", "buyback",
-]
-DEFAULT_NEG_WORDS: List[str] = [
-    # JP (例)
-    "下方修正", "減益", "減収", "赤字", "赤字転落", "不祥事", "訴訟", "買収失敗", "リコール",
-    # EN (例)
-    "miss", "downgrade", "loss", "decline", "fraud", "lawsuit",
-]
 
 # 既存の feature_cols に足すための “代表セット”（A/Bの切替で使う）
 DEFAULT_NEWS_META_COLS = [
@@ -37,17 +22,24 @@ DEFAULT_NEWS_META_COLS = [
     "news_count_3bd_sum",
     "news_count_5bd_sum",
     "news_count_surprise_20bd",
+
+    # GKG: 強度（記事数）
+    "news_gkg_numarts_sum_0d",
+    "news_gkg_numarts_mean_0d",
+    "news_gkg_numarts_3bd_sum",
+    "news_gkg_numarts_5bd_sum",
+    "news_gkg_numarts_surprise_20bd",
+
+    # GKG: 文字列系（最小構成: 件数/ユニーク数/平均長）
+    "news_gkg_themes_items_sum_0d",
+    "news_gkg_themes_items_nunique_0d",
+    "news_gkg_themes_strlen_mean_0d",
+    "news_gkg_organizations_items_sum_0d",
+    "news_gkg_organizations_items_nunique_0d",
+    "news_gkg_organizations_strlen_mean_0d",
     "news_no_news_flag",
 ]
-DEFAULT_NEWS_SENT_COLS = [
-    "news_sent_score_mean_0d",
-    "news_sent_score_sum_0d",
-    "news_pos_hits_0d",
-    "news_neg_hits_0d",
-    "news_pos_ratio_0d",
-    "news_sent_score_3bd_mean",
-    "news_sent_score_5bd_mean",
-]
+DEFAULT_NEWS_SENT_COLS = []  # legacy: NewsAPI.ai 時代の辞書センチメント（title等）由来。GKG-onlyでは未使用。
 
 # GDELT の tone（実数）を日次集計する列
 DEFAULT_NEWS_TONE_COLS = [
@@ -62,13 +54,33 @@ DEFAULT_NEWS_TONE_COLS = [
     "news_tone_abs_mean_0d",
     "news_tone_3bd_mean",
     "news_tone_5bd_mean",
+
+    # GKG V2Tone components（CSVにあれば）
+    "news_v2tone_pos_mean_0d",
+    "news_v2tone_pos_sum_0d",
+    "news_v2tone_pos_3bd_mean",
+    "news_v2tone_pos_5bd_mean",
+    "news_v2tone_neg_mean_0d",
+    "news_v2tone_neg_sum_0d",
+    "news_v2tone_neg_3bd_mean",
+    "news_v2tone_neg_5bd_mean",
+    "news_v2tone_pol_mean_0d",
+    "news_v2tone_pol_sum_0d",
+    "news_v2tone_pol_3bd_mean",
+    "news_v2tone_pol_5bd_mean",
+    "news_v2tone_wc_mean_0d",
+    "news_v2tone_wc_sum_0d",
+    "news_v2tone_wc_3bd_mean",
+    "news_v2tone_wc_5bd_mean",
 ]
 
 # Backward-compat alias（旧: NewsAPI.ai の sentiment_api を想定した名前）
 DEFAULT_NEWS_API_SENT_COLS = DEFAULT_NEWS_TONE_COLS
 
-REQUIRED_COLS = ["published_at", "title", "url"]  # GDELT移行: URLを一意キーに使う
+REQUIRED_COLS = ["published_at", "url"]  # GKG-only: title は特徴量に使わないため必須にしない
 
+# featureset / cache key version（特徴量定義を変えたら更新する）
+NEWS_FEAT_CACHE_VER = "v4"
 
 def _parse_close_minutes(market_close_time: str) -> int:
     hh, mm = market_close_time.strip().split(":")
@@ -115,10 +127,6 @@ def load_news(path: str) -> pd.DataFrame:
         if c not in df.columns:
             raise ValueError(f"[news] missing required column: {c}")
 
-    # GDELTでは本文が安定して取れないことが多いので、無ければ空文字で補完（辞書センチメントはtitleだけでも動く）
-    if "body" not in df.columns:
-        df["body"] = ""
-
     # 取得元（ドメインなど）
     if "source" not in df.columns:
         df["source"] = ""
@@ -139,6 +147,10 @@ def load_news(path: str) -> pd.DataFrame:
             df["tone"] = np.nan
     else:
         df["tone"] = pd.to_numeric(df.get("tone"), errors="coerce")
+    # GKG由来の追加数値列（存在すれば numeric 化しておく）
+    for c in ("tone_pos", "tone_neg", "tone_pol", "tone_wc", "gkg_numarts"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df.get(c), errors="coerce")
 
     return df
 
@@ -162,7 +174,20 @@ def align_news_to_trading_day(
     close_min = _parse_close_minutes(market_close_time)
 
     minutes = pub.dt.hour * 60 + pub.dt.minute
-    is_after_close = (minutes >= close_min).astype(int)
+
+    # --- Leakage guard for GKG daily ---
+    # GKG日次は published_at が「00:00:00 UTC」固定になりがちで、これは実際の発信時刻ではない。
+    # そのままJSTに変換すると 09:00 扱いになり “引け前” 判定→当日特徴量として使われうるため、
+    # 「UTCでほぼ全件が00:00:00」の場合は強制的に翌取引日に送る（= after close 扱い）.
+    has_gkg_cols = any(str(c).startswith("gkg_") for c in out.columns) or ("gkg_numarts" in out.columns)
+    pub_utc = pub.dt.tz_convert("UTC")
+    utc_midnight = (pub_utc.dt.hour == 0) & (pub_utc.dt.minute == 0) & (pub_utc.dt.second == 0)
+    utc_midnight_ratio = float(utc_midnight.mean()) if len(utc_midnight) else 0.0
+
+    if has_gkg_cols and utc_midnight_ratio > 0.95:
+        is_after_close = pd.Series(1, index=out.index, dtype=int)
+    else:
+        is_after_close = (minutes >= close_min).astype(int)
 
     base_day = pub.dt.normalize().dt.tz_localize(None)  # その日の00:00（naive）
     target_day = base_day + pd.to_timedelta(is_after_close, unit="D")
@@ -184,26 +209,6 @@ def align_news_to_trading_day(
     return out
 
 
-def _build_mixed_pattern(words: Sequence[str]) -> re.Pattern:
-    """
-    ASCII単語は \\bword\\b で境界をつけ、それ以外は部分一致。
-    """
-    parts = []
-    for w in words:
-        w = w.strip()
-        if not w:
-            continue
-        esc = re.escape(w)
-        if all(ord(ch) < 128 for ch in w):  # ASCIIっぽい
-            parts.append(rf"\b{esc}\b")
-        else:
-            parts.append(esc)
-    if not parts:
-        # 何も無いときは「絶対マッチしない」パターン
-        return re.compile(r"a^")
-    return re.compile("|".join(parts), flags=re.IGNORECASE)
-
-
 def featurize_news_daily(
     aligned_news: pd.DataFrame,
     trading_days: pd.DatetimeIndex,
@@ -219,7 +224,10 @@ def featurize_news_daily(
     text_cols: Sequence[str] = ("title",),
 ) -> pd.DataFrame:
     """
-    trade_date単位の日次特徴量を作る（A/B両対応）。
+    trade_date単位の日次特徴量を作る（GKG-only）。
+
+    NOTE:
+      - title/body を使った辞書センチメントは生成しません（pos_words/neg_words/text_cols は互換のため残っていますが未使用）。
     返り値は trading_days と同じ index を持つ DataFrame（0埋め済み）。
     """
     if aligned_news.empty:
@@ -255,54 +263,60 @@ def featurize_news_daily(
         prev_mean = meta["news_count_0d"].rolling(long_window, min_periods=1).mean().shift(1)
         meta["news_count_surprise_20bd"] = (meta["news_count_0d"] - prev_mean).fillna(0.0)
 
+        # --- GKG: numarts（記事量の強度） ---
+        if "gkg_numarts" in aligned_news.columns:
+            tmp_gkg = aligned_news[["trade_date", "gkg_numarts"]].copy()
+            tmp_gkg["gkg_numarts"] = pd.to_numeric(tmp_gkg["gkg_numarts"], errors="coerce")
+            g3 = tmp_gkg.groupby("trade_date")
+            meta["news_gkg_numarts_sum_0d"] = g3["gkg_numarts"].sum(min_count=1).fillna(0.0).astype(float)
+            meta["news_gkg_numarts_mean_0d"] = g3["gkg_numarts"].mean().fillna(0.0).astype(float)
+        else:
+            meta["news_gkg_numarts_sum_0d"] = 0.0
+            meta["news_gkg_numarts_mean_0d"] = 0.0
+
+        for w in rolling_windows:
+            meta[f"news_gkg_numarts_{w}bd_sum"] = meta["news_gkg_numarts_sum_0d"].rolling(w, min_periods=1).sum()
+
+        prev_mean_g = meta["news_gkg_numarts_sum_0d"].rolling(long_window, min_periods=1).mean().shift(1)
+        meta["news_gkg_numarts_surprise_20bd"] = (meta["news_gkg_numarts_sum_0d"] - prev_mean_g).fillna(0.0)
+
+        # --- GKG: 文字列系（最小の統計量） ---
+        def _add_gkg_text_stats(col: str, prefix: str) -> None:
+            if col not in aligned_news.columns:
+                meta[f"{prefix}_items_sum_0d"] = 0.0
+                meta[f"{prefix}_items_nunique_0d"] = 0.0
+                meta[f"{prefix}_strlen_mean_0d"] = 0.0
+                return
+
+            s = aligned_news[col].fillna("").astype(str)
+            # 区切り: ';' と ',' を想定（GKGのフィールドは両方が混ざり得る）
+            item_cnt = np.where(s.str.len() > 0, s.str.count(r"[;,]") + 1, 0).astype(float)
+
+            tmp_txt = pd.DataFrame({"trade_date": aligned_news["trade_date"].values})
+            tmp_txt["item_cnt"] = item_cnt
+            tmp_txt["strlen"] = s.str.len().astype(float)
+
+            gtxt = tmp_txt.groupby("trade_date")
+            meta[f"{prefix}_items_sum_0d"] = gtxt["item_cnt"].sum().astype(float)
+            meta[f"{prefix}_strlen_mean_0d"] = gtxt["strlen"].mean().fillna(0.0).astype(float)
+
+            # ユニーク数（トークン単位）
+            tmp_items = aligned_news[["trade_date", col]].copy()
+            tmp_items[col] = s
+            tmp_items = tmp_items.assign(_item=tmp_items[col].str.split(r"[;,]")).explode("_item")
+            tmp_items["_item"] = tmp_items["_item"].fillna("").astype(str).str.strip()
+            tmp_items = tmp_items[tmp_items["_item"] != ""]
+            uniq = tmp_items.groupby("trade_date")["_item"].nunique(dropna=True).astype(float)
+            meta[f"{prefix}_items_nunique_0d"] = uniq.reindex(meta.index).fillna(0.0)
+
+        _add_gkg_text_stats("gkg_themes", "news_gkg_themes")
+        _add_gkg_text_stats("gkg_organizations", "news_gkg_organizations")
+        
         daily_parts.append(meta)
 
-    # --- B) sentiment (simple lexicon) ---
+    # --- B) tone / V2Tone（数値シグナルのみ。title/bodyベースの辞書センチメントは作らない） ---
     if use_sentiment:
-        pos = list(pos_words) if pos_words is not None else DEFAULT_POS_WORDS
-        neg = list(neg_words) if neg_words is not None else DEFAULT_NEG_WORDS
-        pos_re = _build_mixed_pattern(pos)
-        neg_re = _build_mixed_pattern(neg)
-
-        # text_cols はGDELT向けに ("title",) をデフォルトにしているが、
-        # 既存資産（本文あり）にも対応できるよう可変長で結合する。
-        text_parts: List[pd.Series] = []
-        for c in text_cols:
-            if c in aligned_news.columns:
-                text_parts.append(aligned_news[c].fillna("").astype(str))
-        if not text_parts:
-            text = aligned_news["title"].fillna("").astype(str)
-        else:
-            text = text_parts[0]
-            for s in text_parts[1:]:
-                text = text + " " + s
-        # count occurrences (non-overlapping)
-        pos_hits = text.str.count(pos_re)
-        neg_hits = text.str.count(neg_re)
-
         tmp = aligned_news.copy()
-        tmp["pos_hits"] = pos_hits.astype(float)
-        tmp["neg_hits"] = neg_hits.astype(float)
-        tmp["sent_score"] = (tmp["pos_hits"] - tmp["neg_hits"]) / (tmp["pos_hits"] + tmp["neg_hits"] + 1.0)
-
-        g = tmp.groupby("trade_date")
-        sent = pd.DataFrame(index=g.size().index)
-
-        sent["news_sent_score_sum_0d"] = g["sent_score"].sum().astype(float)
-        sent["news_sent_score_mean_0d"] = g["sent_score"].mean().fillna(0.0).astype(float)
-        sent["news_pos_hits_0d"] = g["pos_hits"].sum().astype(float)
-        sent["news_neg_hits_0d"] = g["neg_hits"].sum().astype(float)
-        sent["news_pos_ratio_0d"] = (sent["news_pos_hits_0d"] / (sent["news_pos_hits_0d"] + sent["news_neg_hits_0d"] + 1e-9)).fillna(0.0)
-
-        # rolling “記事数重み付き”平均（sum / count）
-        cnt = g.size().astype(float).rename("cnt")
-        sent = sent.join(cnt)
-        for w in rolling_windows:
-            roll_sum = sent["news_sent_score_sum_0d"].rolling(w, min_periods=1).sum()
-            roll_cnt = sent["cnt"].rolling(w, min_periods=1).sum()
-            sent[f"news_sent_score_{w}bd_mean"] = (roll_sum / (roll_cnt + 1e-9)).fillna(0.0)
-
-        sent = sent.drop(columns=["cnt"])
 
         # --- GDELT "tone" を日次集計 ---
         # GDELT DOC API の ArtList は記事ごとに tone（実数）を返すことがある。
@@ -338,10 +352,37 @@ def featurize_news_daily(
             tone[f"news_tone_{w}bd_mean"] = (roll_sum / (roll_cnt + 1e-9)).fillna(0.0)
         tone = tone.drop(columns=["tone_cnt"])
 
-        # 辞書センチメントのDataFrameに結合して1つの塊として扱う
-        sent = sent.join(tone, how="left")
+        # --- GKG V2Tone components（pos/neg/pol/wc） ---
+        v2_specs = [
+            ("tone_pos", "pos"),
+            ("tone_neg", "neg"),
+            ("tone_pol", "pol"),
+            ("tone_wc", "wc"),
+        ]
+        v2 = pd.DataFrame(index=g2.size().index)
 
-        daily_parts.append(sent)
+        for raw_col, tag in v2_specs:
+            if raw_col in tmp.columns:
+                tmp[f"v2_{tag}"] = pd.to_numeric(tmp[raw_col], errors="coerce")
+            else:
+                tmp[f"v2_{tag}"] = np.nan
+
+            g3 = tmp.groupby("trade_date")
+            v_sum = g3[f"v2_{tag}"].sum(min_count=1).fillna(0.0).astype(float)
+            v_mean = g3[f"v2_{tag}"].mean().fillna(0.0).astype(float)
+            v_cnt = g3[f"v2_{tag}"].count().astype(float)
+
+            v2[f"news_v2tone_{tag}_sum_0d"] = v_sum
+            v2[f"news_v2tone_{tag}_mean_0d"] = v_mean
+
+            for w in rolling_windows:
+                roll_sum = v_sum.rolling(w, min_periods=1).sum()
+                roll_cnt = v_cnt.rolling(w, min_periods=1).sum()
+                v2[f"news_v2tone_{tag}_{w}bd_mean"] = (roll_sum / (roll_cnt + 1e-9)).fillna(0.0)
+
+        tone = tone.join(v2, how="left")
+
+        daily_parts.append(tone)
 
     # --- merge parts on trade_date ---
     daily = daily_parts[0]
@@ -406,7 +447,7 @@ def add_news_features(
     )
     _p(f"[NEWS] raw_path={news_path} exists={Path(news_path).exists()} cache_dir={str(cache_root)}")
     rw = "-".join(map(str, rolling_windows))
-    cache_name = f"newsfeat_{ticker}_{start}_{end}_A{int(use_meta)}B{int(use_sentiment)}_w{rw}_lw{long_window}_close{market_close_time.replace(':','')}.parquet"
+    cache_name = f"newsfeat_{NEWS_FEAT_CACHE_VER}_{ticker}_{start}_{end}_A{int(use_meta)}B{int(use_sentiment)}_w{rw}_lw{long_window}_close{market_close_time.replace(':','')}.parquet"
     cache_path = cache_root / cache_name
     meta_path = cache_root / (cache_name + ".meta.json")
 
@@ -465,7 +506,6 @@ def add_news_features(
                 "use_sentiment": use_sentiment,
                 "rolling_windows": list(rolling_windows),
                 "long_window": long_window,
-                "text_cols": list(text_cols),
                 "date_span": [start, end],
             }
             meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")

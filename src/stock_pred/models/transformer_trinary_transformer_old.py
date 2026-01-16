@@ -9,6 +9,7 @@ USE_TOPIX_FEATURES = False  #falseで無効化
 
 import time
 import os
+import argparse
 import math
 import numbers
 import numpy as np
@@ -90,8 +91,10 @@ LOGCFG = LogConfig(
 class DataConfig:
     """データ前処理と特徴量派生・出力先など、データ寄りの設定集。"""
     ticker: str = "7203.T"          # 対象ティッカー
-    start: str = "2001-01-01"       # 取得開始日
-    end: str = "2024-12-31"         # 取得終了日
+    # start: str = "2001-01-01"       # 取得開始日
+    # end: str = "2024-12-31"         # 取得終了日
+    start: str = "2013-04-01"       # 取得開始日
+    end: str = "2025-12-31"         # 取得終了日
     horizon: int = 1                # 何日先(H)を予測するか
     win: int = 60                   # 時系列窓幅(Transformerへの入力長)
     top_p: float = 0.10             # 異常サブセット評価(|r_H|上位p%)
@@ -116,7 +119,10 @@ class DataConfig:
     output_root: str = "transformer/figs"
 
     use_news: bool = True
-    news_path: str = "data/news/raw/{ticker}.csv"
+    # Feature selection
+    use_mi: bool = True           # Mutual Information による特徴量選択を行うか
+    mi_thr: float = 1e-4          # MI の採用閾値（use_mi=True のときのみ使用）
+    news_path: str = "data/news/raw_gkg_test/{ticker}.csv"
     news_cache_dir: str = "data/news/features"
     news_tz: str = "Asia/Tokyo"
     news_market_close_time: str = "15:30"
@@ -431,6 +437,8 @@ def main():
             "k_tau": _safe_float(DATA.k_tau),
             "top_p": _safe_float(DATA.top_p),
             "output_root": getattr(DATA, "output_root", None),
+            "use_mi": bool(getattr(DATA, "use_mi", True)),
+            "mi_thr": _safe_float(getattr(DATA, "mi_thr", None)),
         },
         "train": {
             "epochs": int(TRAIN.epochs),
@@ -591,7 +599,71 @@ def main():
         iv_in_idx = np.arange(cut, n_tr_total)     # 内側検証（直近側）
 
         # --- MI選択 & スケーラfit は tr_in のみ ---
-        feats  = mi_select(Xtr_df.iloc[tr_in_idx], ytr[tr_in_idx], thr=1e-4)
+        # NOTE: MI は tr_in（学習の過去側）のみで計算し、リークを避ける。
+        news_cols_all = [c for c in feature_cols_final if c.startswith("news_")]
+        if getattr(DATA, "use_mi", True):
+            feats = mi_select(
+                Xtr_df.iloc[tr_in_idx],
+                ytr[tr_in_idx],
+                thr=float(getattr(DATA, "mi_thr", 1e-4)),
+            )
+            news_cols_sel = [c for c in feats if c.startswith("news_")]
+
+            mi_selected_info = {
+                "use_mi": True,
+                "mi_thr": float(getattr(DATA, "mi_thr", 1e-4)),
+                "total_selected": int(len(feats)),
+                "news_selected": int(len(news_cols_sel)),
+                "news_total": int(len(news_cols_all)),
+                "news_cols_selected": news_cols_sel,
+            }
+
+            if DATA.use_news and len(news_cols_all) > 0:
+                ratio = 100.0 * len(news_cols_sel) / max(len(news_cols_all), 1)
+                print(
+                    f"[MI] Fold {fold}: selected={len(feats)} features "
+                    f"(news {len(news_cols_sel)}/{len(news_cols_all)} = {ratio:.1f}%)"
+                )
+                if len(news_cols_sel) == 0:
+                    print(f"[MI] Fold {fold}: news_selected=0 (all news features filtered by MI)")
+                else:
+                    show_n = 12
+                    head = news_cols_sel[:show_n]
+                    tail = "" if len(news_cols_sel) <= show_n else f" ... (+{len(news_cols_sel)-show_n} more)"
+                    print(
+                        f"[MI] Fold {fold}: news_selected(head {min(show_n,len(news_cols_sel))}/{len(news_cols_sel)})="
+                        f"{head}{tail}"
+                    )
+            else:
+                print(f"[MI] Fold {fold}: selected={len(feats)} features (news 0/0)")
+        else:
+            # MIを無効化して全特徴量を採用
+            feats = list(feature_cols_final)
+            news_cols_sel = list(news_cols_all)
+
+            mi_selected_info = {
+                "use_mi": False,
+                "mi_thr": None,
+                "total_selected": int(len(feats)),
+                "news_selected": int(len(news_cols_sel)),
+                "news_total": int(len(news_cols_all)),
+                "news_cols_selected": news_cols_sel,
+            }
+
+            if DATA.use_news and len(news_cols_all) > 0:
+                print(
+                    f"[MI] Fold {fold}: DISABLED -> using ALL {len(feats)} features "
+                    f"(news {len(news_cols_sel)}/{len(news_cols_all)} = 100.0%)"
+                )
+                show_n = 12
+                head = news_cols_sel[:show_n]
+                tail = "" if len(news_cols_sel) <= show_n else f" ... (+{len(news_cols_sel)-show_n} more)"
+                print(
+                    f"[MI] Fold {fold}: news_selected(head {min(show_n,len(news_cols_sel))}/{len(news_cols_sel)})="
+                    f"{head}{tail}"
+                )
+            else:
+                print(f"[MI] Fold {fold}: DISABLED -> using ALL {len(feats)} features")
         scaler = StandardScaler().fit(Xtr_df.iloc[tr_in_idx][feats].values)
 
         # 変換（tr全体→後で tr_in / iv_in に切り分け、outer は別に変換）
@@ -762,6 +834,7 @@ def main():
 
         fold_rec = {
             "fold": int(fold),
+            "mi_selected": mi_selected_info,
             "counts_raw": {
                 "tr_in": int(len(tr_in_idx)),
                 "iv_in": int(len(iv_in_idx)),
@@ -970,6 +1043,24 @@ def save_and_plot_metrics(metrics_log: list, figdir: str, task: str):
 
 # ===== 実行エントリポイント（スイープ → 最終実行） =====
 if __name__ == "__main__":
+    # ---- CLI overrides (optional) ----
+    parser = argparse.ArgumentParser(description="Trinary Transformer (with optional MI feature selection toggle)")
+    parser.add_argument(
+        "--mi",
+        dest="use_mi",
+        action=argparse.BooleanOptionalAction,
+        default=getattr(DATA, "use_mi", True),
+        help="Enable Mutual Information feature selection (default: on). Use --no-mi to disable and use ALL features.",
+    )
+    parser.add_argument(
+        "--mi-thr",
+        type=float,
+        default=float(getattr(DATA, "mi_thr", 1e-4)),
+        help="MI threshold used when --mi is enabled (default: 1e-4).",
+    )
+    args = parser.parse_args()
+    DATA.use_mi = bool(args.use_mi)
+    DATA.mi_thr = float(args.mi_thr)
     set_seeds(42)
     did_sweep = False   #いずれかの探索を実行したかどうか
 
@@ -1094,8 +1185,8 @@ if __name__ == "__main__":
     set_seeds(42)
     print("\n" + "="*70)
     if did_sweep:
-        print(f"Final run with BEST settings: WIN={DATA.win}, K_TAU={DATA.k_tau:.2f}, COSINE_ALPHA={TRAIN.cosine_alpha:.4f}")
+        print(f"Final run with BEST settings: WIN={DATA.win}, K_TAU={DATA.k_tau:.2f}, COSINE_ALPHA={TRAIN.cosine_alpha:.4f}, MI={'ON' if DATA.use_mi else 'OFF'}")
     else:
-        print(f"Final run (no sweeps): WIN={DATA.win}, K_TAU={DATA.k_tau:.2f}, COSINE_ALPHA={TRAIN.cosine_alpha:.4f}")
+        print(f"Final run (no sweeps): WIN={DATA.win}, K_TAU={DATA.k_tau:.2f}, COSINE_ALPHA={TRAIN.cosine_alpha:.4f}, MI={'ON' if DATA.use_mi else 'OFF'}")
     print("="*70)
     _ = main()

@@ -8,3 +8,17 @@ __pycache__/
 **/figs/
 **/run_summary.json
 .env
+
+# --- fetched news artifacts (GDELT etc.) ---
+data/news/raw_gkg_test/
+data/news/raw_gkg/
+data/news/raw_doc/
+data/news/raw/
+data/news/cache/
+data/news/features/
+
+# zipや一時ファイルが直下に出る場合
+data/news/**/*.zip
+data/news/**/*.gz
+data/news/**/*.parquet
+data/news/**/*.csv

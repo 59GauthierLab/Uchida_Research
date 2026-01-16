@@ -755,6 +755,7 @@ def main():
         n_classes = 3 if TASK == "trinary" else 2
         fold_rec = {
             "fold": int(fold),
+            "mi_selected": mi_selected_info,
             "counts_raw": {
                 "tr_in": int(len(abs_tr_in_idx)),
                 "iv_in": int(len(abs_iv_in_idx)),

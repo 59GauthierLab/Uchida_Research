@@ -67,6 +67,12 @@ GKG_IDX_URL = 10           # SOURCEURLS（複数;区切り）
 GKG_IDX_ORGS = 6           # ORGANIZATIONS
 GKG_IDX_V2ORGS = 6         # 日次では独立列が無いので互換のため同列扱い
 GKG_IDX_V2TONE = 7         # TONE (Tone,Pos,Neg,...)
+GKG_IDX_NUMARTS = 1        # NUMARTS
+GKG_IDX_COUNTS = 2         # COUNTS
+GKG_IDX_THEMES = 3         # THEMES
+GKG_IDX_LOCATIONS = 4      # LOCATIONS
+GKG_IDX_PERSONS = 5        # PERSONS
+GKG_IDX_CAMEOEVENTIDS = 8  # CAMEOEVENTIDS
 # ---------------------------
 # Data structures
 # ---------------------------
@@ -156,16 +162,57 @@ def _safe_float(x: Any) -> Optional[float]:
         return float(x)
     except Exception:
         return None
+
+def _clip_str(x: Any, max_len: int = 2048) -> str:
+    """Clip long strings to keep CSV size reasonable."""
+    if x is None:
+        return ""
+    s = str(x)
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 1] + "…"
     
-def _parse_gkg_v2tone(v2tone: Any) -> Optional[float]:
-    # V2Tone = "Tone,Positive,Negative,Polarity,ActivityRefDensity,SelfGroupRefDensity,WordCount"
+def _parse_gkg_v2tone_parts(v2tone: Any) -> Dict[str, Optional[float]]:
+    """
+    Parse GKG V2Tone into numeric components.
+    V2Tone = "Tone,Positive,Negative,Polarity,ActivityRefDensity,SelfGroupRefDensity,WordCount"
+    Returns keys: tone, tone_pos, tone_neg, tone_pol, tone_act, tone_self, tone_wc
+    """
+    out: Dict[str, Optional[float]] = {
+        "tone": None,
+        "tone_pos": None,
+        "tone_neg": None,
+        "tone_pol": None,
+        "tone_act": None,
+        "tone_self": None,
+        "tone_wc": None,
+    }
     if v2tone is None:
-        return None
+        return out
     s = str(v2tone).strip()
     if not s:
-        return None
-    head = s.split(",")[0].strip()
-    return _safe_float(head)
+        return out
+    parts = [p.strip() for p in s.split(",")]
+    # Some rows may be shorter; fill what we can.
+    if len(parts) >= 1:
+        out["tone"] = _safe_float(parts[0])
+    if len(parts) >= 2:
+        out["tone_pos"] = _safe_float(parts[1])
+    if len(parts) >= 3:
+        out["tone_neg"] = _safe_float(parts[2])
+    if len(parts) >= 4:
+        out["tone_pol"] = _safe_float(parts[3])
+    if len(parts) >= 5:
+        out["tone_act"] = _safe_float(parts[4])
+    if len(parts) >= 6:
+        out["tone_self"] = _safe_float(parts[5])
+    if len(parts) >= 7:
+        out["tone_wc"] = _safe_float(parts[6])
+    return out
+
+def _parse_gkg_v2tone(v2tone: Any) -> Optional[float]:
+    # Backward-compatible: return only "Tone"
+    return _parse_gkg_v2tone_parts(v2tone).get("tone")
 
 
 def _parse_gdelt_seendate(val: Any) -> Optional[datetime]:
@@ -182,6 +229,21 @@ def _parse_gdelt_seendate(val: Any) -> Optional[datetime]:
             return datetime.strptime(s, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
         except Exception:
             return None
+    
+    # DOC API ArticleList JSON often uses basic ISO-8601 like "YYYYMMDDTHHMMSSZ"
+    # Example: "20200403T210000Z"
+    if len(s) == 16 and s[8] == "T" and s.endswith("Z") and s[:8].isdigit() and s[9:15].isdigit():
+        try:
+            return datetime.strptime(s, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+        except Exception:
+            pass
+    # Sometimes without trailing 'Z'
+    if len(s) == 15 and s[8] == "T" and s[:8].isdigit() and s[9:15].isdigit():
+        try:
+            return datetime.strptime(s, "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
+        except Exception:
+            pass
+
     # best-effort ISO-ish
     try:
         s2 = s.replace("Z", "+00:00")
@@ -206,6 +268,52 @@ _LANG_MAP = {
     "rus": "russian",
 }
 
+_LANG2_MAP = {
+    "en": "english",
+    "ja": "japanese",
+}
+
+def _normalize_lang_value(v):
+    lv = str(v or "").strip().lower()
+    if not lv:
+        return ""
+    lv = _LANG2_MAP.get(lv, lv)
+    lv = _LANG_MAP.get(lv, lv)
+    return lv
+
+_NON_ASCII_RE = re.compile(r"[^\x00-\x7F]")
+
+def _is_ascii(s: str) -> bool:
+    try:
+        s.encode("ascii")
+        return True
+    except Exception:
+        return False
+
+def _ascii_keywords(kws):
+    out = []
+    for k in kws or []:
+        ks = str(k or "").strip()
+        if ks and _is_ascii(ks):
+            out.append(ks)
+    # preserve order-ish but unique
+    seen = set()
+    uniq = []
+    for k in out:
+        if k not in seen:
+            seen.add(k)
+            uniq.append(k)
+    return uniq
+
+def _strip_sourcelang_clauses(q: str) -> str:
+    # remove patterns like: AND (sourcelang:english OR sourcelang:japanese)
+    q2 = re.sub(r"\s+AND\s+\(\s*sourcelang:[^)]*\)", "", q, flags=re.IGNORECASE)
+    # remove single token cases: AND sourcelang:english
+    q2 = re.sub(r"\s+AND\s+sourcelang:[^\s)]+", "", q2, flags=re.IGNORECASE)
+    q2 = re.sub(r"\s{2,}", " ", q2).strip()
+    q2 = re.sub(r"^(AND|OR)\s+", "", q2, flags=re.IGNORECASE).strip()
+    q2 = re.sub(r"\s+(AND|OR)$", "", q2, flags=re.IGNORECASE).strip()
+    return q2
 
 def _normalize_langs(langs: Sequence[str]) -> List[str]:
     out: List[str] = []
@@ -243,7 +351,8 @@ def _build_gdelt_query(spec: QuerySpec, langs: Sequence[str], extra_query: Optio
         base = "(" + " OR ".join(kws) + ")" if spec.use_or else " ".join(kws)
 
     nl = _normalize_langs(langs)
-    if nl:
+    # If query_map already contains sourcelang:..., don't append again.
+    if nl and ("sourcelang:" not in base.lower()):
         base = f"{base} AND (" + " OR ".join([f"sourcelang:{l}" for l in nl]) + ")"
 
     if extra_query and extra_query.strip():
@@ -262,7 +371,11 @@ def _http_get_json(url: str, params: Dict[str, Any], *, timeout_s: float, debug:
         try:
             r = requests.get(url, params=params, headers=headers, timeout=timeout_s)
             if r.status_code == 200:
-                return r.json()
+                data = r.json()
+                # GDELT sometimes returns {"error": "..."} with HTTP 200.
+                if isinstance(data, dict) and data.get("error"):
+                    raise RuntimeError(f"GDELT API error: {data.get('error')}")
+                return data
             if r.status_code in (429, 500, 502, 503, 504):
                 wait = min(10.0, (2 ** attempt) * 0.5)
                 if debug:
@@ -547,7 +660,7 @@ def _fetch_gkg_day_rows(
 
     candidates = []
     scanned = 0
-    max_idx = max(GKG_IDX_DATE, GKG_IDX_SOURCE, GKG_IDX_URL, GKG_IDX_ORGS, GKG_IDX_V2TONE)
+    max_idx = max(GKG_IDX_DATE, GKG_IDX_SOURCE, GKG_IDX_URL, GKG_IDX_ORGS, GKG_IDX_V2TONE, GKG_IDX_CAMEOEVENTIDS)
     skipped_short = 0
     skipped_bad_date = 0
     skipped_empty_docid = 0
@@ -589,11 +702,12 @@ def _fetch_gkg_day_rows(
         orgs = str(cols[GKG_IDX_ORGS] or "").strip() if len(cols) > GKG_IDX_ORGS else ""
         v2orgs = str(cols[GKG_IDX_V2ORGS] or "").strip() if len(cols) > GKG_IDX_V2ORGS else ""
         v2tone = cols[GKG_IDX_V2TONE]
-        tone = _parse_gkg_v2tone(v2tone)
+        tone_parts = _parse_gkg_v2tone_parts(v2tone)
+        tone = tone_parts.get("tone")
 
         # キーワード当たり判定の母集団を少しだけ増やす（最小差分）
-        themes = str(cols[3] or "").strip() if len(cols) > 3 else ""
-        persons = str(cols[5] or "").strip() if len(cols) > 5 else ""
+        themes = str(cols[GKG_IDX_THEMES] or "").strip() if len(cols) > GKG_IDX_THEMES else ""
+        persons = str(cols[GKG_IDX_PERSONS] or "").strip() if len(cols) > GKG_IDX_PERSONS else ""
         blob = " ".join([docids, srcs, themes, persons, orgs, v2orgs])
         hit = _keyword_hit_count(blob, keywords)
         if hit <= 0:
@@ -614,6 +728,21 @@ def _fetch_gkg_day_rows(
                 "source": src,
                 "lang": "",
                 "tone": tone if tone is not None else "",
+                "tone_pos": tone_parts.get("tone_pos") if tone_parts.get("tone_pos") is not None else "",
+                "tone_neg": tone_parts.get("tone_neg") if tone_parts.get("tone_neg") is not None else "",
+                "tone_pol": tone_parts.get("tone_pol") if tone_parts.get("tone_pol") is not None else "",
+                "tone_act": tone_parts.get("tone_act") if tone_parts.get("tone_act") is not None else "",
+                "tone_self": tone_parts.get("tone_self") if tone_parts.get("tone_self") is not None else "",
+                "tone_wc": tone_parts.get("tone_wc") if tone_parts.get("tone_wc") is not None else "",
+                "gkg_numarts": _safe_float(cols[GKG_IDX_NUMARTS]) if len(cols) > GKG_IDX_NUMARTS else "",
+                "gkg_counts": _clip_str(cols[GKG_IDX_COUNTS]) if len(cols) > GKG_IDX_COUNTS else "",
+                "gkg_themes": _clip_str(cols[GKG_IDX_THEMES]) if len(cols) > GKG_IDX_THEMES else "",
+                "gkg_locations": _clip_str(cols[GKG_IDX_LOCATIONS]) if len(cols) > GKG_IDX_LOCATIONS else "",
+                "gkg_persons": _clip_str(cols[GKG_IDX_PERSONS]) if len(cols) > GKG_IDX_PERSONS else "",
+                "gkg_organizations": _clip_str(cols[GKG_IDX_ORGS]) if len(cols) > GKG_IDX_ORGS else "",
+                "gkg_cameoeventids": _clip_str(cols[GKG_IDX_CAMEOEVENTIDS]) if len(cols) > GKG_IDX_CAMEOEVENTIDS else "",
+                "gkg_sources_all": _clip_str(srcs),
+                "gkg_sourceurls_all": _clip_str(docids),
             })
         )
 
@@ -725,7 +854,7 @@ def _read_existing_csv(path: Path) -> List[Dict[str, Any]]:
 
 
 def _write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
-    cols = ["ticker", "published_at", "title", "url", "source", "lang", "tone"]
+    cols = ["ticker", "published_at", "title", "url", "source", "lang", "tone", "tone_pos", "tone_neg", "tone_pol", "tone_act", "tone_self", "tone_wc", "gkg_numarts", "gkg_counts", "gkg_themes", "gkg_locations", "gkg_persons", "gkg_organizations", "gkg_cameoeventids", "gkg_sources_all", "gkg_sourceurls_all"]
     with path.open("w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
@@ -832,7 +961,42 @@ def fetch_and_save_gdelt(
                     debug=config.debug,
                 )
 
+                # If 0 articles, retry once by removing sourcelang clauses and doing lang-filter posthoc.
+                if (not articles) and ("sourcelang:" in gdelt_query.lower()):
+                    retry_query = _strip_sourcelang_clauses(gdelt_query)
+                    if config.debug:
+                        print(f"[WARN] {spec.ticker}: DOC returned 0; retry without sourcelang -> {retry_query}")
+                    articles = _fetch_artlist_window(
+                        endpoint=config.endpoint,
+                        query=retry_query,
+                        start_dt=start_dt,
+                        end_dt=end_dt,
+                        max_items=config.max_items,
+                        max_records=config.max_records,
+                        sort=config.sort,
+                        sleep_s=config.sleep_s,
+                        timeout_s=config.timeout_s,
+                        debug=config.debug,
+                    )
+
                 rows = _rows_from_articles(spec.ticker, articles)
+
+                # Debug only: if API returned articles but we couldn't convert any to rows,
+                # print a small sample to pinpoint schema/date-format issues.
+                if config.debug:
+                    print(f"[DEBUG] {spec.ticker}: DOC articles={len(articles)} rows_pre_lang={len(rows)}")
+                    if articles and not rows:
+                        a0 = articles[0] if isinstance(articles[0], dict) else {}
+                        print(f"[DEBUG] {spec.ticker}: DOC sample seendate={a0.get('seendate') or a0.get('seenDate') or a0.get('date')}, "
+                              f"url={a0.get('url')}, title={a0.get('title')}")
+
+                # Posthoc language filter (more robust than complex sourcelang OR in query)
+                allow = set(_normalize_langs(config.langs))
+                if allow:
+                    before = len(rows)
+                    rows = [r for r in rows if _normalize_lang_value(r.get("lang")) in allow]
+                    if config.debug:
+                        print(f"[DEBUG] {spec.ticker}: DOC lang_filter {before} -> {len(rows)} allow={sorted(allow)}")
 
                 # resume: drop URLs already on disk
                 if existing_urls:
